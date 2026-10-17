@@ -1,0 +1,25 @@
+{
+  "analysis_result": "尚未分析",
+  "auto_adjust": false,
+  "auto_match": true,
+  "color_management": "Standard",
+  "emission_strength": 1.0,
+  "engine": "BLENDER_EEVEE",
+  "exposure": 0.0,
+  "fill_energy": 1.5,
+  "key_energy": 3.0,
+  "name": "",
+  "outline_thickness": 0.004000000189989805,
+  "rim_energy": 2.0,
+  "shadow_color": [
+    0.3799999952316284,
+    0.3199999928474426,
+    0.4399999976158142
+  ],
+  "shadow_position": 0.5,
+  "shadow_strength": 0.699999988079071,
+  "use_agx": false,
+  "use_bloom": false,
+  "use_outline": true,
+  "uv_source": "UVMap"
+}

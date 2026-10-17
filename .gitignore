@@ -1,0 +1,13 @@
+# Python / Blender 运行产物
+__pycache__/
+*.pyc
+*.pyo
+
+# Blender 自动备份
+*.blend1
+*.blend2
+*.blend~
+
+# 临时/渲染输出（正常不该出现在插件目录，兜底忽略）
+_verify_out/
+*.png
