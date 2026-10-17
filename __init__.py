@@ -1075,7 +1075,11 @@ def _on_load(_dummy=None):
         shader._register_face_fwd_driver()
     except Exception:
         pass
-    # 延迟再刷一次: 载入即时读到的物体矩阵可能还是单位矩阵 → sun_dir/face_fwd 会卡错值
+    # 多角色眼透自愈: 把每个眼材质门控重绑到它自己角色的头骨(老文件 hsr_head_arm 缺失时)
+    try:
+        shader.ensure_lash_aov()
+    except Exception:
+        pass
     try:
         bpy.app.timers.register(_deferred_face_fwd_refresh, first_interval=0.1)
         bpy.app.timers.register(_deferred_face_fwd_refresh, first_interval=0.5)

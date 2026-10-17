@@ -2459,6 +2459,23 @@ def _owner_armature(obj):
     return None
 
 
+def _material_owner_armature(mat):
+    """反查【使用该材质的网格】所属骨架(多角色眼透: hsr_head_arm 缺失时自愈)。
+    取第一个能解析出骨架的使用者网格; 都没有 → None。"""
+    if mat is None:
+        return None
+    for o in bpy.data.objects:
+        if o.type != 'MESH':
+            continue
+        for s in o.material_slots:
+            if s.material == mat:
+                arm = _owner_armature(o)
+                if arm is not None:
+                    return arm
+                break
+    return None
+
+
 def _head_bone_of(arm):
     """在该骨架上找头骨(按候选名)。返回 pose_bone 或 None。"""
     if arm is None or arm.type != 'ARMATURE':
@@ -2475,17 +2492,13 @@ _head_arms_count = -1
 
 
 def _referenced_head_arms():
-    """收集所有材质绑定的骨架名(hsr_head_arm, 去重)。按材质数量变化失效。"""
-    global _head_arms_cache, _head_arms_count
-    if _head_arms_cache is not None and _head_arms_count == len(bpy.data.materials):
-        return _head_arms_cache
+    """收集所有材质绑定的骨架名(hsr_head_arm, 去重)。每次重算(材质数不大, O(n) 可接受):
+    按数量缓存会在 hsr_head_arm 后填时陈旧 → face_fwd_dirs 缺键 → 眼透跟错头骨/KeyError。"""
     s = set()
     for m in bpy.data.materials:
         an = m.get("hsr_head_arm")
         if an:
             s.add(an)
-    _head_arms_cache = s
-    _head_arms_count = len(bpy.data.materials)
     return s
 
 
@@ -2627,6 +2640,8 @@ def _add_aov_to_material(m):
         if not has_new:
             _remove_old_gate(nt)
             _build_eye_gate(nt)
+        else:
+            _rebind_eye_gate(nt, m)   # 多角色: 修正 FaceForward 头骨绑定(老文件自愈)
 
     if '透视' not in have and tex is not None:
         a = nt.nodes.new('ShaderNodeOutputAOV')
@@ -2646,18 +2661,83 @@ def _remove_old_gate(nt):
             nt.nodes.remove(n)
 
 
+def _rebind_eye_gate(nt, mat):
+    """多角色自愈: 把已建门控的 FaceForward 驱动重绑到【本材质所属骨架】头骨。
+    老文件里 hsr_head_arm 缺失 → 驱动用了全局 face_fwd(跟错头骨) → 眼透门控偏。
+    只改驱动表达式 + TRANSFORMS 变量目标, 不重建节点。返回是否改动。"""
+    ff = next((n for n in nt.nodes if n.name == "FaceForward"), None)
+    if ff is None:
+        return False
+    global _head_arms_cache
+    arm_key = mat.get("hsr_head_arm") if hasattr(mat, "get") else None
+    arm_obj = bpy.data.objects.get(arm_key) if arm_key else None
+    pb = _head_bone_of(arm_obj)
+    if arm_obj is None or pb is None:
+        ro = _material_owner_armature(mat)
+        rpb = _head_bone_of(ro) if ro is not None else None
+        if ro is not None and rpb is not None:
+            arm_obj, pb, arm_key = ro, rpb, ro.name
+            try:
+                mat["hsr_head_arm"] = arm_key
+            except Exception:
+                pass
+            _head_arms_cache = None
+    if arm_obj is None or pb is None:
+        return False   # 仍无法确定 → 保持现状(全局), 不动
+    bone_name = pb.name
+    ad = nt.animation_data
+    if not ad:
+        return False
+    changed = False
+    for i in range(3):
+        exp = "face_fwd_dirs.get(%r, face_fwd)[%d]" % (arm_key, i)
+        path = 'nodes["FaceForward"].inputs[%d].default_value' % i
+        fc = next((f for f in ad.drivers if f.data_path == path), None)
+        if fc is None:
+            continue
+        try:
+            if fc.driver.expression != exp:
+                fc.driver.expression = exp
+                changed = True
+        except Exception:
+            pass
+        for var in fc.driver.variables:
+            if var.type == 'TRANSFORMS' and var.targets:
+                t = var.targets[0]
+                try:
+                    if t.id != arm_obj or t.bone_target != bone_name:
+                        t.id = arm_obj
+                        t.bone_target = bone_name
+                        changed = True
+                except Exception:
+                    pass
+    return changed
+
+
 def _build_eye_gate(nt):
     """在材质节点树中构建头骨跟随门控链 → AOV '透明'(Value)。
     每角色读【自己骨架】的头骨(mat['hsr_head_arm']); 无骨架/无头骨→退全局 face_fwd。"""
     _register_face_fwd_driver()
     mat = nt.id_data
+    global _head_arms_cache
     arm_key = mat.get("hsr_head_arm") if hasattr(mat, "get") else None
     arm_obj = bpy.data.objects.get(arm_key) if arm_key else None
     pb = _head_bone_of(arm_obj)
+    # 没绑 / 绑了但骨架或头骨已失效 → 从"用该材质的网格"反查其所属骨架(多角色自愈)
+    if arm_obj is None or pb is None:
+        _ro = _material_owner_armature(mat)
+        _rpb = _head_bone_of(_ro) if _ro is not None else None
+        if _ro is not None and _rpb is not None:
+            arm_obj, pb, arm_key = _ro, _rpb, _ro.name
+            try:
+                mat["hsr_head_arm"] = arm_key   # 盖章, 下次直接命中
+            except Exception:
+                pass
+            _head_arms_cache = None             # 让处理器下轮把新骨架纳入 face_fwd_dirs
     if arm_obj is None or pb is None:
         arm_obj, gpb = _find_head_bone()
         bone_name = gpb.name if gpb else '頭'
-        arm_key = None          # 用全局 face_fwd
+        arm_key = None          # 仍无法确定 → 退全局 face_fwd
     else:
         bone_name = pb.name
         ns = bpy.app.driver_namespace
@@ -2684,7 +2764,7 @@ def _build_eye_gate(nt):
         fc = ff.inputs[i].driver_add('default_value')
         drv = fc.driver
         drv.type = 'SCRIPTED'
-        drv.expression = ("face_fwd_dirs[%r][%d]" % (arm_key, i)) if arm_key else ('face_fwd[%d]' % i)
+        drv.expression = ("face_fwd_dirs.get(%r, face_fwd)[%d]" % (arm_key, i)) if arm_key else ('face_fwd[%d]' % i)
         # Transform Channel 变量: 让 depsgraph 追踪【本角色】头骨旋转(变量值未使用, 仅建依赖)
         for axis in ('X', 'Y', 'Z'):
             var = drv.variables.new()
