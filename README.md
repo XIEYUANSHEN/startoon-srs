@@ -49,3 +49,11 @@
 ## 版本
 
 v1.7.1
+
+## 授权
+
+Copyright © 2026 中生
+
+本插件以 **GNU GPLv3** 授权发布（见 `LICENSE`），可自由使用、修改、分发，衍生作品须同样以 GPL 开源。
+插件运行于 GPL 的 Blender 内、并依赖 GPL 的 mmd_tools，故采用 GPL 保持一致。
+仓库仅含插件源码，不含任何 MMD 模型 / PMX / 贴图。
