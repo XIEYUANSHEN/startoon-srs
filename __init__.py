@@ -32,7 +32,7 @@ from . import pmx_morph
 bl_info = {
     "name": "StarToon SRS",
     "author": "AtomCode",
-    "version": (1, 7, 1),
+    "version": (1, 7, 2),
     "blender": (4, 2, 0),
     "location": "3D View > N > HSR Toon",
     "description": "仿崩铁风格 MMD 三渲二: 分类独立参数 + EASE 多级阴影 + 反法线描边 + AOV 眼透",
