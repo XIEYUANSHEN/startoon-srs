@@ -468,11 +468,21 @@ def _ensure_material_sun_vector(mat, nt, gnode):
     sun = mat.get("hsr_sun_name")
     sun_key = sun if sun is not None else ""
     node = next((n for n in nt.nodes if n.label == "本材质太阳方向"), None)
-    # 快路径: 节点已存在、绑的灯没变、且已连到【这个】组节点 → 直接返回(滑条拖动零开销)
+    # 快路径: 节点已存在、绑的灯没变、已连到【这个】组节点、且驱动已是 .get 兜底形式
+    # → 直接返回(滑条拖动零开销)。表达式若还是老的直接下标, 落到下面重写(老文件自愈)。
     if (node is not None and node.type == 'COMBINE_XYZ'
             and node.get("hsr_sun_key", "\x00") == sun_key
             and tgt.is_linked and tgt.links[0].from_node == node):
-        return
+        _ad = nt.animation_data
+        _ok = True
+        for _i in range(3):
+            _path = 'nodes["%s"].inputs[%d].default_value' % (node.name, _i)
+            _fc = next((f for f in _ad.drivers if f.data_path == _path), None) if _ad else None
+            if _fc is None or ".get(" not in _fc.driver.expression:
+                _ok = False
+                break
+        if _ok:
+            return
     # 建时即把该 key 塞进 hsr_sun_dirs, 避免首帧 KeyError(处理器每帧也会重算覆盖)
     ns = bpy.app.driver_namespace
     dirs = ns.get('hsr_sun_dirs')
@@ -495,7 +505,7 @@ def _ensure_material_sun_vector(mat, nt, gnode):
         try:
             fc = node.inputs[i].driver_add('default_value')
             fc.driver.type = 'SCRIPTED'
-            fc.driver.expression = "hsr_sun_dirs[%r][%d]" % (sun, i)
+            fc.driver.expression = "hsr_sun_dirs.get(%r, sun_dir)[%d]" % (sun, i)
         except Exception:
             pass
     for l in list(tgt.links):
@@ -2434,17 +2444,13 @@ _sun_names_count = -1
 
 
 def _referenced_sun_names():
-    """收集所有 toon 材质绑定的灯名(去重)。按材质数量变化失效, 稳态 O(1) 命中缓存。"""
-    global _sun_names_cache, _sun_names_count
-    if _sun_names_cache is not None and _sun_names_count == len(bpy.data.materials):
-        return _sun_names_cache
+    """收集所有 toon 材质绑定的灯名(去重)。每次重算(材质数不大, O(n) 可接受):
+    按数量缓存会在 hsr_sun_name 后填/改名时陈旧 → hsr_sun_dirs 缺键 → 太阳方向驱动 KeyError。"""
     s = set()
     for m in bpy.data.materials:
         sn = m.get("hsr_sun_name")
         if sn:
             s.add(sn)
-    _sun_names_cache = s
-    _sun_names_count = len(bpy.data.materials)
     return s
 
 
