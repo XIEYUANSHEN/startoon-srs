@@ -2610,12 +2610,13 @@ def update_eye_gate_angle(scene):
     if not props or not hasattr(props, "eye_gate_angle"):
         return
     threshold = math.cos(props.eye_gate_angle)
-    for mn in _EYE_AOV_MATERIALS:
-        m = bpy.data.materials.get(mn)
-        if m and m.node_tree:
-            thr = next((n for n in m.node_tree.nodes if n.name == "GateThreshold"), None)
-            if thr:
-                thr.outputs[0].default_value = threshold
+    for m in _eye_aov_targets():
+        nt = m.node_tree if m.use_nodes else None
+        if not nt:
+            continue
+        thr = next((n for n in nt.nodes if n.name == "GateThreshold"), None)
+        if thr:
+            thr.outputs[0].default_value = threshold
 
 
 def _add_aov_to_material(m):
@@ -2913,15 +2914,14 @@ def ensure_lash_aov():
 # ── 眼透架构: 视图层 AOV 注册 + 合成器 MIX/SetAlpha 图(复刻参考文件"合成器节点") ──
 _EYE_AOV_COLOR = "透视"
 _EYE_AOV_MASK = "透明"
-_HAIR_MASK_AOV = "描边掩膜"
 _FACE_MASK_AOV = "面部掩膜"
 
 
 def ensure_eye_through_aov_channels(scene):
-    """视图层注册 透视(COLOR) + 透明(VALUE) + 描边掩膜(VALUE) + 面部掩膜(VALUE) AOV 通道。幂等。"""
+    """视图层注册 透视(COLOR) + 透明(VALUE) + 面部掩膜(VALUE) AOV 通道。幂等。"""
     vl = scene.view_layers[0]
     for aov_name, aov_type in ((_EYE_AOV_COLOR, 'COLOR'), (_EYE_AOV_MASK, 'VALUE'),
-                               (_HAIR_MASK_AOV, 'VALUE'), (_FACE_MASK_AOV, 'VALUE')):
+                               (_FACE_MASK_AOV, 'VALUE')):
         if not any(a.name == aov_name for a in vl.aovs):
             a = vl.aovs.add()
             a.name = aov_name
@@ -2944,29 +2944,6 @@ def ensure_face_mask_aov():
         a.aov_name = _FACE_MASK_AOV
         a.location = (600, -800)
         a.inputs['Value'].default_value = 1.0
-
-
-def ensure_hair_outline_mask():
-    """给头发材质写 AOV 描边掩膜=1.0, 供合成器只对头发剪影做 Sobel 描边。幂等。"""
-    for m in bpy.data.materials:
-        if not m.use_nodes or not m.node_tree:
-            continue
-        is_hair = m.get("hsr_template") == "hair" or any(
-            k in m.name for k in ("髪", "发", "hair", "Hair", "ツインテール", "三つ編み"))
-        if not is_hair:
-            continue
-        nt = m.node_tree
-        if any(n.type == 'OUTPUT_AOV' and getattr(n, "aov_name", "") == _HAIR_MASK_AOV
-               for n in nt.nodes):
-            continue
-        a = nt.nodes.new('ShaderNodeOutputAOV')
-        a.aov_name = _HAIR_MASK_AOV
-        a.location = (600, -720)
-        v = nt.nodes.new('ShaderNodeValue')
-        v.outputs[0].default_value = 1.0
-        v.location = (400, -720)
-        sock = a.inputs['Value'] if 'Value' in a.inputs else a.inputs[0]
-        nt.links.new(v.outputs[0], sock)
 
 
 def setup_eye_through_compositor(scene):
