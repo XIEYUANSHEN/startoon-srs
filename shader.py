@@ -2922,6 +2922,13 @@ _EYE_AOV_COLOR = "透视"
 _EYE_AOV_MASK = "透明"
 _FACE_MASK_AOV = "面部掩膜"
 
+# 合成器里【插件自建节点】的 label 集合: 重建时只删这些, 保留用户自己的节点(如星空/泛光组)
+_PLUGIN_LABELS = frozenset((
+    "分离颜色", "眼透强度", "眼透半径", "眼透MIX", "还原alpha",
+    "描边Sobel", "深度归一", "描边加粗", "描边硬化", "×面部掩膜",
+    "描边MIX", "描边颜色", "辉光", "合成预览",
+))
+
 
 def ensure_eye_through_aov_channels(scene):
     """视图层注册 透视(COLOR) + 透明(VALUE) + 面部掩膜(VALUE) AOV 通道。幂等。"""
@@ -3023,145 +3030,167 @@ def setup_eye_through_compositor(scene):
                     pass
             elif n.label == "描边颜色" and n.type == 'RGB':
                 n.outputs[0].default_value = (*ocolor, 1.0)
-        # 描边开关/模式变化需重建(链结构变: depth↔hair↔none)
+        # 描边开关/模式变化需重建(链结构变); 未变则只刷参数后返回。
+        # 重建走下面"只删插件节点"的逻辑, 不碰用户自己的节点。
         has_outline = any(n.label == "描边Sobel" for n in cg.nodes)
         cur_mode = cg.get("st_outline_mode", "face" if has_outline else None)
-        if has_outline != use_outline or cur_mode != outline_mode:
-            for n in list(cg.nodes):
-                cg.nodes.remove(n)
-        else:
+        if not (has_outline != use_outline or cur_mode != outline_mode):
             return
 
-    if not cg.nodes:
-        for n in list(cg.nodes):
+    # ── 与用户自带合成器组共存: 眼透链插到其输出端, 不覆盖用户效果 ──
+    # 底图 base_sock: 重建时=旧眼透MIX 的 A 输入源(用户原链输出);
+    #                  首次插入用户组时=Group Output 的 Image 输入源(若非插件节点);
+    #                  都没有(插件自建空组)=None → 用渲染层 Image。
+    mix_old = next((n for n in cg.nodes if n.label == "眼透MIX"), None)
+    base_sock = None
+    if mix_old is not None and mix_old.inputs[6].is_linked:
+        base_sock = mix_old.inputs[6].links[0].from_socket
+    go = next((n for n in cg.nodes if n.type == 'GROUP_OUTPUT'), None)
+    if base_sock is None and go is not None:
+        for s in go.inputs:
+            if s.is_linked:
+                srcn = s.links[0].from_node
+                if getattr(srcn, "label", "") not in _PLUGIN_LABELS:
+                    base_sock = s.links[0].from_socket
+                break
+    # 只删插件自建节点, 保留用户节点(如 DeepSpaceComp 的 Glare) + RenderLayers + GroupOutput
+    for n in list(cg.nodes):
+        if getattr(n, "label", "") in _PLUGIN_LABELS:
             cg.nodes.remove(n)
-
+    rl = next((n for n in cg.nodes if n.type == 'R_LAYERS'), None)
+    if rl is None:
         rl = cg.nodes.new("CompositorNodeRLayers")
         rl.location = (-900, 0)
         rl.layer = scene.view_layers[0].name
+    base_img = base_sock if base_sock is not None else rl.outputs["Image"]
 
-        # ── 对齐参考"合成器节点"图 ──
-        # 分离颜色(取渲染层 Image 的 alpha 给 SetAlpha)
-        sep = cg.nodes.new("CompositorNodeSepColor") if hasattr(bpy.types, "CompositorNodeSepColor") else cg.nodes.new("CompositorNodeSeparateColor")
-        sep.location = (-500, -300); sep.label = "分离颜色"
-        cg.links.new(rl.outputs["Image"], sep.inputs["Image"])
+    # ── 对齐参考"合成器节点"图 ──
+    # 分离颜色(取底图 alpha 给 SetAlpha)
+    sep = cg.nodes.new("CompositorNodeSepColor") if hasattr(bpy.types, "CompositorNodeSepColor") else cg.nodes.new("CompositorNodeSeparateColor")
+    sep.location = (-500, -300); sep.label = "分离颜色"
+    cg.links.new(base_img, sep.inputs["Image"])
 
-        # 相乘: 透明(可扩散) × 强度 → 混合系数
-        math_n = cg.nodes.new("ShaderNodeMath")
-        math_n.location = (-500, -550); math_n.operation = 'MULTIPLY'
-        math_n.inputs[1].default_value = round(strength, 3); math_n.label = "眼透强度"
-        if blur_px > 0:
-            blur = cg.nodes.new("CompositorNodeBlur")
-            blur.location = (-680, -550); blur.label = "眼透半径"
+    # 相乘: 透明(可扩散) × 强度 → 混合系数
+    math_n = cg.nodes.new("ShaderNodeMath")
+    math_n.location = (-500, -550); math_n.operation = 'MULTIPLY'
+    math_n.inputs[1].default_value = round(strength, 3); math_n.label = "眼透强度"
+    if blur_px > 0:
+        blur = cg.nodes.new("CompositorNodeBlur")
+        blur.location = (-680, -550); blur.label = "眼透半径"
+        try:
+            s = blur.inputs["Size"]
             try:
-                s = blur.inputs["Size"]
-                try:
-                    s.default_value = blur_px
-                except Exception:
-                    s.default_value = (blur_px, blur_px)
+                s.default_value = blur_px
+            except Exception:
+                s.default_value = (blur_px, blur_px)
+        except Exception:
+            pass
+        cg.links.new(rl.outputs[_EYE_AOV_MASK], blur.inputs["Image"])
+        cg.links.new(blur.outputs["Image"], math_n.inputs[0])
+    else:
+        cg.links.new(rl.outputs[_EYE_AOV_MASK], math_n.inputs[0])
+
+    # 混合: A=底图(用户链输出或渲染层), B=透视, Fac=透明×强度
+    mix = cg.nodes.new("ShaderNodeMix")
+    mix.data_type = "RGBA"; mix.blend_type = 'MIX'
+    mix.location = (-250, 100); mix.label = "眼透MIX"
+    cg.links.new(math_n.outputs["Value"], mix.inputs[0])
+    cg.links.new(base_img, mix.inputs[6])
+    cg.links.new(rl.outputs[_EYE_AOV_COLOR], mix.inputs[7])
+
+    # 设置 Alpha: 图像=混合结果, Alpha=分离颜色.Alpha
+    set_alpha = cg.nodes.new("CompositorNodeSetAlpha")
+    set_alpha.location = (0, 100); set_alpha.label = "还原alpha"
+    cg.links.new(mix.outputs[2], set_alpha.inputs["Image"])
+    cg.links.new(sep.outputs["Alpha"], set_alpha.inputs["Alpha"])
+    prev_out = set_alpha.outputs["Image"]
+
+    # ── 描边: 面部合成器模式 = 深度Sobel → 加粗 → ×面部掩膜(只在面部出边) ──
+    if use_outline:
+        sobel = cg.nodes.new("CompositorNodeFilter")
+        sobel.location = (-50, -350); sobel.label = "描边Sobel"
+        try:
+            sobel.inputs["Type"].default_value = 'Sobel'
+            sobel.inputs["Factor"].default_value = 1.0   # 固定边缘检测强度
+        except Exception:
+            pass
+        nrm = cg.nodes.new("CompositorNodeNormalize")
+        nrm.location = (-250, -350); nrm.label = "深度归一"
+        cg.links.new(rl.outputs["Depth"], nrm.inputs["Value"])
+        cg.links.new(nrm.outputs["Value"], sobel.inputs["Image"])
+        # 加粗: 模糊把 1~2px 的 Sobel 边扩成 face_px 宽的带, 再硬化成利边
+        dil = cg.nodes.new("CompositorNodeBlur")
+        dil.location = (20, -420); dil.label = "描边加粗"
+        try:
+            dil.filter_type = 'FAST'
+            s = dil.inputs["Size"]
+            try:
+                s.default_value = (face_px, face_px)
+            except Exception:
+                s.default_value = face_px
+        except Exception:
+            pass
+        cg.links.new(sobel.outputs["Image"], dil.inputs["Image"])
+        hard = cg.nodes.new("ShaderNodeMath")
+        hard.operation = 'GREATER_THAN'
+        hard.location = (120, -460); hard.label = "描边硬化"
+        try:
+            hard.inputs[1].default_value = 0.15
+        except Exception:
+            pass
+        cg.links.new(dil.outputs["Image"], hard.inputs[0])
+        # 用面部掩膜把边缘限制在面部区域(避免与壳重边)
+        fmask = cg.nodes.new("ShaderNodeMath")
+        fmask.operation = 'MULTIPLY'
+        fmask.location = (220, -250); fmask.label = "×面部掩膜"
+        cg.links.new(hard.outputs['Value'], fmask.inputs[0])
+        cg.links.new(rl.outputs[_FACE_MASK_AOV], fmask.inputs[1])
+        omix = cg.nodes.new("ShaderNodeMix")
+        omix.data_type = "RGBA"; omix.blend_type = 'MIX'
+        omix.location = (200, -100); omix.label = "描边MIX"
+        orgb = cg.nodes.new("CompositorNodeRGB")
+        orgb.location = (0, -350); orgb.label = "描边颜色"
+        orgb.outputs[0].default_value = (*ocolor, 1.0)
+        cg.links.new(fmask.outputs["Value"], omix.inputs[0])
+        cg.links.new(prev_out, omix.inputs[6])
+        cg.links.new(orgb.outputs[0], omix.inputs[7])
+        prev_out = omix.outputs[2]
+        cg["st_outline_mode"] = outline_mode
+
+    # ── 辉光(Glare): 默认关(面板 use_glare 开), 开着时做泛光 ──
+    use_glare = bool(getattr(props, "use_glare", False)) if props else False
+    if use_glare:
+        glare = cg.nodes.new("CompositorNodeGlare")
+        glare.location = (400, 0); glare.label = "辉光"
+        def _gset(_name, _val):
+            try:
+                glare.inputs[_name].default_value = _val
             except Exception:
                 pass
-            cg.links.new(rl.outputs[_EYE_AOV_MASK], blur.inputs["Image"])
-            cg.links.new(blur.outputs["Image"], math_n.inputs[0])
-        else:
-            cg.links.new(rl.outputs[_EYE_AOV_MASK], math_n.inputs[0])
+        _gset("Type", getattr(props, "glare_type", 'Fog Glow'))
+        _gset("Quality", getattr(props, "glare_quality", 'High'))
+        _gset("Threshold", float(getattr(props, "glare_threshold", 0.8)))
+        _gset("Size", float(getattr(props, "glare_size", 0.5)))
+        _gset("Strength", float(getattr(props, "glare_strength", 1.0)))
+        cg.links.new(prev_out, glare.inputs["Image"])
+        final_img = glare.outputs["Image"]
+    else:
+        final_img = prev_out
 
-        # 混合: A=渲染层图像, B=透视, Fac=透明×0.5
-        mix = cg.nodes.new("ShaderNodeMix")
-        mix.data_type = "RGBA"; mix.blend_type = 'MIX'
-        mix.location = (-250, 100); mix.label = "眼透MIX"
-        cg.links.new(math_n.outputs["Value"], mix.inputs[0])
-        cg.links.new(rl.outputs["Image"], mix.inputs[6])
-        cg.links.new(rl.outputs[_EYE_AOV_COLOR], mix.inputs[7])
-
-        # 设置 Alpha: 图像=混合结果, Alpha=分离颜色.Alpha
-        set_alpha = cg.nodes.new("CompositorNodeSetAlpha")
-        set_alpha.location = (0, 100); set_alpha.label = "还原alpha"
-        cg.links.new(mix.outputs[2], set_alpha.inputs["Image"])
-        cg.links.new(sep.outputs["Alpha"], set_alpha.inputs["Alpha"])
-        prev_out = set_alpha.outputs["Image"]
-
-        # ── 描边: 面部合成器模式 = 深度Sobel → 加粗 → ×面部掩膜(只在面部出边) ──
-        if use_outline:
-            sobel = cg.nodes.new("CompositorNodeFilter")
-            sobel.location = (-50, -350); sobel.label = "描边Sobel"
-            try:
-                sobel.inputs["Type"].default_value = 'Sobel'
-                sobel.inputs["Factor"].default_value = 1.0   # 固定边缘检测强度
-            except Exception:
-                pass
-            nrm = cg.nodes.new("CompositorNodeNormalize")
-            nrm.location = (-250, -350); nrm.label = "深度归一"
-            cg.links.new(rl.outputs["Depth"], nrm.inputs["Value"])
-            cg.links.new(nrm.outputs["Value"], sobel.inputs["Image"])
-            # 加粗: 模糊把 1~2px 的 Sobel 边扩成 face_px 宽的带, 再 Map Range 硬化成利边
-            dil = cg.nodes.new("CompositorNodeBlur")
-            dil.location = (20, -420); dil.label = "描边加粗"
-            try:
-                dil.filter_type = 'FAST'
-                s = dil.inputs["Size"]
-                try:
-                    s.default_value = (face_px, face_px)
-                except Exception:
-                    s.default_value = face_px
-            except Exception:
-                pass
-            cg.links.new(sobel.outputs["Image"], dil.inputs["Image"])
-            hard = cg.nodes.new("ShaderNodeMath")
-            hard.operation = 'GREATER_THAN'
-            hard.location = (120, -460); hard.label = "描边硬化"
-            try:
-                hard.inputs[1].default_value = 0.15
-            except Exception:
-                pass
-            cg.links.new(dil.outputs["Image"], hard.inputs[0])
-            # 用面部掩膜把边缘限制在面部区域(身体/头发处掩膜=0 → 不叠加合成器边, 避免与壳重边)
-            fmask = cg.nodes.new("ShaderNodeMath")
-            fmask.operation = 'MULTIPLY'
-            fmask.location = (220, -250); fmask.label = "×面部掩膜"
-            cg.links.new(hard.outputs['Value'], fmask.inputs[0])
-            cg.links.new(rl.outputs[_FACE_MASK_AOV], fmask.inputs[1])
-            omix = cg.nodes.new("ShaderNodeMix")
-            omix.data_type = "RGBA"; omix.blend_type = 'MIX'
-            omix.location = (200, -100); omix.label = "描边MIX"
-            orgb = cg.nodes.new("CompositorNodeRGB")
-            orgb.location = (0, -350); orgb.label = "描边颜色"
-            orgb.outputs[0].default_value = (*ocolor, 1.0)
-            cg.links.new(fmask.outputs["Value"], omix.inputs[0])
-            cg.links.new(prev_out, omix.inputs[6])
-            cg.links.new(orgb.outputs[0], omix.inputs[7])
-            prev_out = omix.outputs[2]
-            cg["st_outline_mode"] = outline_mode
-
-        # ── 辉光(Glare): 默认关(面板 use_glare 开), 开着时做泛光 ──
-        # ⚠ 用 Blender 5.x socket API。旧属性 glare_type/quality/threshold/size/mix 在 5.2
-        #   已不存在(赋值抛 AttributeError 被吞 → 节点停在默认 Streaks 且参数全无 = 哑火)。
-        #   5.x 里 Type/Quality 的枚举标识是带空格显示串('Fog Glow'/'High'), 实测确认。
-        use_glare = bool(getattr(props, "use_glare", False)) if props else False
-        if use_glare:
-            glare = cg.nodes.new("CompositorNodeGlare")
-            glare.location = (400, 0); glare.label = "辉光"
-            def _gset(_name, _val):
-                try:
-                    glare.inputs[_name].default_value = _val
-                except Exception:
-                    pass
-            _gset("Type", getattr(props, "glare_type", 'Fog Glow'))
-            _gset("Quality", getattr(props, "glare_quality", 'High'))
-            _gset("Threshold", float(getattr(props, "glare_threshold", 0.8)))
-            _gset("Size", float(getattr(props, "glare_size", 0.5)))
-            _gset("Strength", float(getattr(props, "glare_strength", 1.0)))
-            cg.links.new(prev_out, glare.inputs["Image"])
-            final_img = glare.outputs["Image"]
-        else:
-            final_img = prev_out
-
-        viewer = cg.nodes.new("CompositorNodeViewer")
-        viewer.location = (650, -260); viewer.label = "合成预览"
-        out = cg.nodes.new("NodeGroupOutput")
-        out.location = (650, 0)
-        cg.links.new(final_img, viewer.inputs["Image"])
-        cg.links.new(final_img, out.inputs[0])
+    viewer = cg.nodes.new("CompositorNodeViewer")
+    viewer.location = (650, -260); viewer.label = "合成预览"
+    if go is None:
+        go = cg.nodes.new("NodeGroupOutput")
+        go.location = (650, 0)
+    cg.links.new(final_img, viewer.inputs["Image"])
+    # 接回 Group Output 的 Image 输入(用户组=叠在其原输出之后; 插件组=直接输出)
+    tgt_sock = next((s for s in go.inputs if s.name == "Image"), None)
+    if tgt_sock is None and len(go.inputs):
+        tgt_sock = go.inputs[0]
+    if tgt_sock is not None:
+        for l in list(tgt_sock.links):
+            cg.links.remove(l)
+        cg.links.new(final_img, tgt_sock)
 
 
 
