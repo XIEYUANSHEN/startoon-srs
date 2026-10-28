@@ -240,12 +240,13 @@ def _mat_base(name):
     return re.sub(r'\.\d{3}$', '', name)
 
 
-def _material_vertex_indices(mesh_obj):
+def _material_vertex_indices(mesh_obj, targets=None):
     """返回 {形态材质名(kw): 该材质槽覆盖的顶点 index 集合}。
     按【去后缀名】匹配(修 🟠: 多模型时 衣後紗.001 精确匹配失败→隐藏形状键空→纱层不塌)。
+    targets 省略时用 morph 表名单; 传入则用传入名单(供"本网格实际纱类材质"泛用兜底)。
     单模型(昔涟)名字本就精确, 去后缀=原名, 行为不变。"""
     me = mesh_obj.data
-    targets = set(_get_morph_material_names())
+    targets = set(_get_morph_material_names()) if targets is None else set(targets)
     result = {kw: set() for kw in targets}
     if not targets:
         return result
@@ -263,13 +264,44 @@ def _material_vertex_indices(mesh_obj):
     return {k: v for k, v in result.items() if v}
 
 
+_VEIL_KW = ("纱", "紗", "透", "veil", "gauze", "sheer", "lace", "レース", "フリル", "frill")
+
+
+def _veil_keyword_targets(mesh_obj):
+    """泛用兜底: 本网格里材质名含 纱/透/veil 等关键词的材质(去后缀)。供无 morph 命中时识别纱层。"""
+    out = set()
+    for s in mesh_obj.material_slots:
+        if s.material:
+            b = _mat_base(s.material.name)
+            if any(k in b for k in _VEIL_KW):
+                out.add(b)
+    return out
+
+
 def ensure_veil_hide_shapekeys(mesh_obj):
-    """为 6 个纱层各建一个隐藏形状键(幂等):
+    """为本网格【实际存在】的纱层材质各建一个隐藏形状键(幂等):
     key 的 offset = 塌缩点 - basis 坐标, 仅作用于该层顶点, 其余为 0。
     value=1 时该层顶点收拢到塌缩点(面积→0, 不可见); value=0 恢复。
+    ⚠ 只为"本网格确实有该材质顶点"的层建键(有数据才建, 泛用任意模型);
+      名单(morph 表)无命中时退到本网格自身的纱/透类关键词材质;
+      并清理已存在、但本网格已无对应材质顶点的空 HSR_hide_* 键。
     返回创建的 key 名列表。"""
     import mathutils
     me = mesh_obj.data
+    verts_by_mat = _material_vertex_indices(mesh_obj)             # morph名单 ∩ 实际顶点
+    if not verts_by_mat:
+        verts_by_mat = _material_vertex_indices(mesh_obj, _veil_keyword_targets(mesh_obj))  # 泛用兜底
+    # 清理: 已存在但本网格无对应材质顶点的空 HSR_hide_* 键(旧版无条件建出来的)
+    if me.shape_keys is not None:
+        for kb in list(me.shape_keys.key_blocks):
+            nm = kb.name
+            if nm.startswith("HSR_hide_") and not verts_by_mat.get(nm[len("HSR_hide_"):]):
+                try:
+                    mesh_obj.shape_key_remove(kb)
+                except Exception:
+                    pass
+    if not verts_by_mat:
+        return []
     if me.shape_keys is None:
         mesh_obj.shape_key_add(name="Basis", from_mix=False)
     basis = me.shape_keys.key_blocks[0]
@@ -280,10 +312,10 @@ def ensure_veil_hide_shapekeys(mesh_obj):
     collapse = _collapse_point(mesh_obj)
     local_collapse = mesh_obj.matrix_world.inverted() @ collapse
 
-    verts_by_mat = _material_vertex_indices(mesh_obj)
-
     created = []
-    for mat_name in _get_morph_material_names():
+    for mat_name, verts in verts_by_mat.items():
+        if not verts:
+            continue
         key_name = _hide_key_name(mat_name)
         kb = me.shape_keys.key_blocks.get(key_name)
         is_new = False
@@ -292,7 +324,6 @@ def ensure_veil_hide_shapekeys(mesh_obj):
             kb.value = 0.0
             created.append(key_name)
             is_new = True
-        verts = verts_by_mat.get(mat_name, set())
         co = list(basis_co)  # 复制 basis
         for vi in verts:
             co[vi * 3 + 0] = local_collapse.x
