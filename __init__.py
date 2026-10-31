@@ -418,10 +418,10 @@ class HSRToonProperties(bpy.types.PropertyGroup):
     )
     eye_gate_angle: FloatProperty(
         name="水平可见半角",
-        description="眼透门控: 相机与人脸朝向夹角在此范围内显示眼透(带渐变过渡)。≤90°=只正面半球可见(默认90°, 背面不漏)。过大(如128°)会让背后偏侧也漏眼透。",
-        default=1.5708,
+        description="眼透门控: 相机与人脸朝向夹角在此范围内显示眼透(带渐变过渡)。90°=正面半球, 可调到180°放宽到侧面。",
+        default=2.2340214,
         min=0.0174533,
-        max=1.5708,
+        max=3.14159265,
         subtype='ANGLE',
         update=_update_eye_gate_angle,
     )
@@ -1101,13 +1101,6 @@ def _on_load(_dummy=None):
     # 多角色眼透自愈: 把每个眼材质门控重绑到它自己角色的头骨(老文件 hsr_head_arm 缺失时)
     try:
         shader.ensure_lash_aov()
-    except Exception:
-        pass
-    # 老文件门控阈值按新 90° 上限重算(旧的 128° 会从背后偏侧漏眼透)
-    try:
-        _sc = bpy.context.scene
-        if _sc is not None:
-            shader.update_eye_gate_angle(_sc)
     except Exception:
         pass
     try:
