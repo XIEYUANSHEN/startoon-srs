@@ -2615,7 +2615,7 @@ def update_eye_gate_angle(scene):
     props = getattr(scene, "hsr_toon", None)
     if not props or not hasattr(props, "eye_gate_angle"):
         return
-    threshold = math.cos(props.eye_gate_angle)
+    threshold = math.cos(min(float(props.eye_gate_angle), math.pi / 2))
     for m in _eye_aov_targets():
         nt = m.node_tree if m.use_nodes else None
         if not nt:
@@ -2758,10 +2758,11 @@ def _build_eye_gate(nt):
             except Exception:
                 fd[arm_key] = tuple(ns.get('face_fwd', (0.0, -1.0, 0.0)))
 
-    # 读取当前角度阈值
+    # 读取当前角度阈值(半角上限 90°: 超过正半球会从背后偏侧漏眼透)
     scene = bpy.context.scene
     props = getattr(scene, "hsr_toon", None)
-    threshold = math.cos(props.eye_gate_angle) if props and hasattr(props, "eye_gate_angle") else 0.0
+    _ang = float(getattr(props, "eye_gate_angle", math.pi / 2)) if props else math.pi / 2
+    threshold = math.cos(min(_ang, math.pi / 2))
 
     # FaceForward: CombineXYZ, X/Y/Z 各挂 SCRIPTED 驱动(读本材质骨架头骨方向, 无则全局)
     ff = nt.nodes.new('ShaderNodeCombineXYZ')

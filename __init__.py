@@ -418,10 +418,10 @@ class HSRToonProperties(bpy.types.PropertyGroup):
     )
     eye_gate_angle: FloatProperty(
         name="水平可见半角",
-        description="眼透门控: 相机与人脸朝向夹角在此范围内显示眼透(带渐变过渡)。90°=正面半球, 可调到180°放宽到侧面。",
-        default=2.2340214,
+        description="眼透门控: 相机与人脸朝向夹角在此范围内显示眼透(带渐变过渡)。≤90°=只正面半球可见(默认90°, 背面不漏)。过大(如128°)会让背后偏侧也漏眼透。",
+        default=1.5708,
         min=0.0174533,
-        max=3.14159265,
+        max=1.5708,
         subtype='ANGLE',
         update=_update_eye_gate_angle,
     )
@@ -772,71 +772,94 @@ class HSR_OT_ToggleForm(bpy.types.Operator):
                 return o
         return None
 
+    @staticmethod
+    def _mesh_for_kw(context, kw):
+        """多人场景: 定位"含目标材质(base 名含 kw)"的可见角色网格。
+        形态按钮(環ON/後紗ON/頭紗…)因此作用到拥有该材质的那个角色, 而非场景里第一个 mesh。"""
+        for o in context.scene.objects:
+            if o.type != "MESH" or o.hide_render:
+                continue
+            for s in o.material_slots:
+                if s.material and kw in pmx_morph._mat_base(s.material.name):
+                    return o
+        return None
+
     def execute(self, context):
-        global _FORM_MORPH_MAP
         forms = _get_filtered_forms()
         morph_ops = forms.get(self.form_name, [])
         if not morph_ops:
             self.report({"WARNING"}, "未知形态: %s" % self.form_name)
             return {"CANCELLED"}
 
-        mesh_obj = self._mesh_obj(context)
-        if mesh_obj is None:
+        # 逐 kw 定位"目标角色网格"(多人场景: 按材质归属, 不取场景第一个 mesh)
+        involved = {}
+        for kw, _op in morph_ops:
+            mo = self._mesh_for_kw(context, kw)
+            if mo is not None:
+                involved.setdefault(mo.name, mo)
+        if not involved:
+            mo = self._mesh_obj(context)
+            if mo is not None:
+                involved[mo.name] = mo
+        if not involved:
             self.report({"WARNING"}, "未找到角色网格")
             return {"CANCELLED"}
+        for mo in involved.values():
+            pmx_morph.ensure_veil_hide_shapekeys(mo)
 
-        # 确保隐藏形状键存在
-        pmx_morph.ensure_veil_hide_shapekeys(mesh_obj)
-        sk = mesh_obj.data.shape_keys
-        if sk is None:
-            self.report({"WARNING"}, "无形状键")
-            return {"CANCELLED"}
+        def _kw_mesh(kw):
+            return self._mesh_for_kw(context, kw) or next(iter(involved.values()))
 
-        # 判断当前 morph 是否处于"已应用态": 按形状键/Value 的实际值反推,
-        # 兼容 hide 类(眼镜消失)与 show 类(头纱出现)——旧逻辑只认 show, 导致 hide-only 单向。
+        # 判断当前态(以第一个可判定的 kw 为准)
         applied = None
         for kw, op in morph_ops:
+            mo = _kw_mesh(kw)
+            sk = mo.data.shape_keys if mo is not None else None
             kb = sk.key_blocks.get(pmx_morph._hide_key_name(kw)) if sk else None
             if kb is not None:
-                # hide-op: value>0.5=已塌缩=已应用; show-op: value<0.5=已展开=已应用
                 applied = (kb.value > 0.5) if op == "hide" else (kb.value < 0.5)
                 break
-            # 退化为读 Value 节点(alpha 层)
-            for mat in bpy.data.materials:
-                if mat.get("hsr_stage") == "virtual_sun" and mat.node_tree and kw in mat.name:
+            if mo is not None:
+                for sl in mo.material_slots:
+                    mat = sl.material
+                    if not mat or mat.get("hsr_stage") != "virtual_sun" or not mat.node_tree:
+                        continue
+                    if kw not in mat.name:
+                        continue
                     nodes = _show_nodes(mat)
                     if nodes:
                         v = nodes[0].outputs["Value"].default_value
-                        # show-op: 显示(>0.1)=已应用; hide-op: 隐藏(<0.1)=已应用
                         applied = (v > 0.1) if op == "show" else (v < 0.1)
                     break
             if applied is not None:
                 break
         if applied is None:
             applied = False
-        new = not applied   # 本次点击后要进入的态
+        new = not applied
 
         count = 0
         for kw, op in morph_ops:
+            mo = _kw_mesh(kw)
+            sk = mo.data.shape_keys if mo is not None else None
             kb = sk.key_blocks.get(pmx_morph._hide_key_name(kw)) if sk else None
             if kb is not None:
-                # 形状键: 0=展开, 1=塌缩。应用态下 hide→塌缩(1), show→展开(0)
                 kb.value = 1.0 if ((op == "hide") == new) else 0.0
                 count += 1
                 continue
-            # 退化为 alpha 切换(表情层等共享顶点的材质)
-            orig = None
-            for mat in bpy.data.materials:
-                if mat.get("hsr_stage") != "virtual_sun" or not mat.node_tree:
+            # 退化为 alpha 切换(限本角色网格上的同名材质, 不误伤其他角色)
+            if mo is None:
+                continue
+            for sl in mo.material_slots:
+                mat = sl.material
+                if not mat or mat.get("hsr_stage") != "virtual_sun" or not mat.node_tree:
                     continue
                 if kw not in mat.name:
                     continue
-                if orig is None:
-                    orig = float(mat.get("hsr_orig_alpha", 1.0))
+                orig = float(mat.get("hsr_orig_alpha", 1.0))
                 for node in _show_nodes(mat):
                     if op == "show":
                         node.outputs["Value"].default_value = orig if new else 0.0
-                    else:  # hide
+                    else:
                         node.outputs["Value"].default_value = 0.0 if new else orig
                     count += 1
 
@@ -1078,6 +1101,13 @@ def _on_load(_dummy=None):
     # 多角色眼透自愈: 把每个眼材质门控重绑到它自己角色的头骨(老文件 hsr_head_arm 缺失时)
     try:
         shader.ensure_lash_aov()
+    except Exception:
+        pass
+    # 老文件门控阈值按新 90° 上限重算(旧的 128° 会从背后偏侧漏眼透)
+    try:
+        _sc = bpy.context.scene
+        if _sc is not None:
+            shader.update_eye_gate_angle(_sc)
     except Exception:
         pass
     try:
