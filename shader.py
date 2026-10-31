@@ -2482,6 +2482,61 @@ def _material_owner_armature(mat):
     return None
 
 
+def _arm_in_scene(arm, scene_arms):
+    """把骨架映射到【当前场景内】的真身: 已在内→原样; 是陈旧重复副本→按名字找同基名的
+    场景内副本(如 '..._arm' 指向 '..._arm.001'); 都找不到→None。只有单个场景骨架集时放行。"""
+    if arm is None:
+        return None
+    if not scene_arms:
+        return arm
+    if arm in scene_arms:
+        return arm
+    base = arm.name
+    for a in scene_arms:
+        if a.name == base or a.name.startswith(base + "."):
+            return a
+    return None
+
+
+def _scene_armature_for_material(mat, scene=None):
+    """解析驱动"使用该材质的可见网格"的【当前场景内】骨架, 排除不在场景的陈旧重复副本。
+    多人场景: 每个角色的眼材质属于各自网格 → 返回各自角色骨架(不串)。
+    用对象引用(是否在 scene.objects)判断, 不看名字(.001/.002 改名也不误判);
+    陈旧副本会按名字映射到场景内真身。"""
+    if mat is None:
+        return None
+    if scene is None:
+        try:
+            scene = bpy.context.scene
+        except Exception:
+            scene = None
+    scene_arms = set(o for o in (scene.objects if scene is not None else [])
+                     if o.type == 'ARMATURE')
+    if not scene_arms:
+        scene_arms = set(o for o in bpy.data.objects if o.type == 'ARMATURE')
+    cands = []
+    for o in bpy.data.objects:
+        if o.type != 'MESH':
+            continue
+        if not any(s.material == mat for s in o.material_slots):
+            continue
+        arm = None
+        for md in o.modifiers:
+            if md.type == 'ARMATURE' and md.object is not None and md.object.type == 'ARMATURE':
+                la = _arm_in_scene(md.object, scene_arms)
+                if la is not None:
+                    arm = la
+                    break
+        if arm is None and o.parent is not None and o.parent.type == 'ARMATURE':
+            arm = _arm_in_scene(o.parent, scene_arms)
+        if arm is not None:
+            cands.append((o, arm))
+    if not cands:
+        return None
+    vis = [c for c in cands if not c[0].hide_render]
+    return (vis or cands)[0][1]
+
+
 def _head_bone_of(arm):
     """在该骨架上找头骨(按候选名)。返回 pose_bone 或 None。"""
     if arm is None or arm.type != 'ARMATURE':
@@ -2552,16 +2607,25 @@ def _face_fwd_update(*_args):
         except Exception:
             pass
     # 每角色各读自己骨架的头骨 → 材质驱动 face_fwd_dirs[自身骨架名] 各追各的
+    # ⚠ 只认【当前场景内】的骨架: 指向场景外陈旧重复副本/无头骨 → 喂 0(长度0→门控关),
+    #   绝不用陈旧朝向或全局兜底(否则多人+动作会让某角色门控被别的头"顶开"→后脑漏眼)。
     try:
+        try:
+            _sc = bpy.context.scene
+        except Exception:
+            _sc = None
+        _scene_arms = set(o for o in (_sc.objects if _sc is not None else []) if o.type == 'ARMATURE')
         fdirs = {}
         for an in _referenced_head_arms():
             a = bpy.data.objects.get(an)
-            hp = _head_bone_of(a)
+            hp = None
+            if a is not None and a.type == 'ARMATURE' and (not _scene_arms or a in _scene_arms):
+                hp = _head_bone_of(a)
             if hp is not None:
                 cc = (a.matrix_world @ hp.matrix).col[2]
                 fdirs[an] = (cc.x, cc.y, cc.z)
             else:
-                fdirs[an] = tuple(glob_fwd)   # 骨架删了/无头骨→退全局, 保证键存在
+                fdirs[an] = (0.0, 0.0, 0.0)   # 解析不到场景内骨架 → 门控关(安全)
         ns['face_fwd_dirs'] = fdirs
     except Exception:
         pass
@@ -2676,11 +2740,17 @@ def _rebind_eye_gate(nt, mat):
     if ff is None:
         return False
     global _head_arms_cache
+    try:
+        _sc = bpy.context.scene
+    except Exception:
+        _sc = None
+    _scene_arms = set(o for o in (_sc.objects if _sc is not None else []) if o.type == 'ARMATURE')
     arm_key = mat.get("hsr_head_arm") if hasattr(mat, "get") else None
     arm_obj = bpy.data.objects.get(arm_key) if arm_key else None
     pb = _head_bone_of(arm_obj)
-    if arm_obj is None or pb is None:
-        ro = _material_owner_armature(mat)
+    # 绑的骨架不存在/无头骨/不在当前场景(陈旧重复副本) → 重新解析到场景内真正驱动的骨架
+    if arm_obj is None or pb is None or (_scene_arms and arm_obj not in _scene_arms):
+        ro = _scene_armature_for_material(mat, _sc)
         rpb = _head_bone_of(ro) if ro is not None else None
         if ro is not None and rpb is not None:
             arm_obj, pb, arm_key = ro, rpb, ro.name
@@ -2727,12 +2797,17 @@ def _build_eye_gate(nt):
     _register_face_fwd_driver()
     mat = nt.id_data
     global _head_arms_cache
+    try:
+        _sc = bpy.context.scene
+    except Exception:
+        _sc = None
+    _scene_arms = set(o for o in (_sc.objects if _sc is not None else []) if o.type == 'ARMATURE')
     arm_key = mat.get("hsr_head_arm") if hasattr(mat, "get") else None
     arm_obj = bpy.data.objects.get(arm_key) if arm_key else None
     pb = _head_bone_of(arm_obj)
-    # 没绑 / 绑了但骨架或头骨已失效 → 从"用该材质的网格"反查其所属骨架(多角色自愈)
-    if arm_obj is None or pb is None:
-        _ro = _material_owner_armature(mat)
+    # 没绑 / 失效 / 指向不在场景的陈旧重复骨架 → 解析到"用该材质的可见网格"的场景内骨架(各角色各归各)
+    if arm_obj is None or pb is None or (_scene_arms and arm_obj not in _scene_arms):
+        _ro = _scene_armature_for_material(mat, _sc)
         _rpb = _head_bone_of(_ro) if _ro is not None else None
         if _ro is not None and _rpb is not None:
             arm_obj, pb, arm_key = _ro, _rpb, _ro.name
