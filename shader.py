@@ -237,15 +237,28 @@ def get_sun_light(scene=None):
     name = scene.get("hsr_sun_name") if scene is not None else None
     if name:
         o = bpy.data.objects.get(name)
-        if o is not None and o.type == "LIGHT" and getattr(o.data, "type", None) == "SUN":
+        # 只认【在视口可见】的记录灯: hide_viewport=True 的是历史遗留/调试灯(如 InspectionSun),
+        # 用户选不中、调不动, 且常指正头顶把角色打黑 → 不认这条陈旧记录, 落到下面按可见主光重选。
+        if (o is not None and o.type == "LIGHT" and getattr(o.data, "type", None) == "SUN"
+                and not o.hide_viewport):
             return o
     o = bpy.data.objects.get("HSR_SunLight")
     if o is not None and o.type == "LIGHT":
         return o
     if scene is not None:
-        for ob in scene.objects:
-            if ob.type == "LIGHT" and getattr(ob.data, "type", None) == "SUN":
-                return ob
+        suns = [ob for ob in scene.objects
+                if ob.type == "LIGHT" and getattr(ob.data, "type", None) == "SUN"]
+        # 兜底优先【可见 + 参与渲染 + 有能量】的太阳, 跳过隐藏的历史遗留灯:
+        #   场景里常残留一盏 hide_viewport/render=True、且朝向正头顶(0,0,1)的调试灯(如 InspectionSun),
+        #   旧版按 scene.objects 随机顺序取"第一盏 SUN"会抢先命中它 → 虚拟太阳被绑到一盏
+        #   用户根本选不中/调不动的灯, 阴影打歪甚至打黑。可见主光(如 · 主日光)才是该用的。
+        vis = [ob for ob in suns
+               if not ob.hide_viewport and not ob.hide_render
+               and getattr(ob.data, "energy", 0.0) > 0.0]
+        if vis:
+            return max(vis, key=lambda o: getattr(o.data, "energy", 0.0))
+        if suns:
+            return suns[0]
     return None
 
 
@@ -2218,6 +2231,80 @@ def schedule_region_refresh(scene):
     _region_timer = bpy.app.timers.register(_do, first_interval=0.2)
 
 
+def _weld_skin_and_smooth(obj, skin_idx):
+    """焊接皮肤(skin)面的重合分顶点(极小阈值, 只并真正重合的 UV 缝点) + 清自定义分法线 + 重新平滑。
+    返回 (ok, merged_count)。
+    ⚠ 自定义分法线是整网格级、无法只清几面; 且只清不"重算方向"(normals_make_consistent)——
+    重算会在重叠薄壳上翻法线、把模型算碎。焊接只作用于皮肤面, 不碰头发/衣服拓扑。"""
+    import bmesh
+    prev_active = bpy.context.view_layer.objects.active
+    prev_sel = [o for o in bpy.context.selected_objects]
+    before = len(obj.data.vertices)
+    try:
+        for o in prev_sel:
+            o.select_set(False)
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='EDIT')
+        # 1) 只选皮肤面 → 焊重合分顶点
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bm = bmesh.from_edit_mesh(obj.data)
+        for f in bm.faces:
+            f.select = f.material_index in skin_idx
+        bmesh.update_edit_mesh(obj.data)
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        bpy.ops.mesh.remove_doubles(threshold=0.0001)
+        # 2) 清自定义分法线(整网格) + 平滑
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.customdata_custom_splitnormals_clear()
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.shade_smooth()
+        return True, max(0, before - len(obj.data.vertices))
+    except Exception as exc:
+        print("[StarToon] 平滑皮肤法线失败(%s):" % obj.name, exc)
+        return False, 0
+    finally:
+        obj.select_set(False)
+        for o in prev_sel:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = prev_active
+
+
+def apply_smooth_skin_normals(scene, objs=None):
+    """对【含皮肤(skin)材质】且带烘焙自定义分法线的网格, 清掉分法线并平滑。
+    平/硬法线会让三渲二阴影在裸露皮肤(如昔涟肩膀)显出三角网格。
+    开关 props.smooth_skin_normals 关 → 不动(保留模型故意的硬边法线, 如风格化头发/机械件)。
+    返回人类可读报告字符串(清了哪些网格、皮肤面数、其中平法线数)。"""
+    from mathutils import Vector
+    props = getattr(scene, "hsr_toon", None)
+    if props is not None and not getattr(props, "smooth_skin_normals", True):
+        return "开关已关 → 保留原始硬边法线, 未处理"
+    if objs is None:
+        objs = [o for o in scene.objects if o.type == 'MESH' and not o.hide_render]
+    touched = []
+    for obj in objs:
+        if obj.type != 'MESH':
+            continue
+        me = obj.data
+        skin_slots = {i for i, s in enumerate(obj.material_slots)
+                      if s.material and _cat_of_material(s.material) == 'skin'}
+        if not skin_slots:
+            continue
+        skin_faces = sum(1 for p in me.polygons if p.material_index in skin_slots)
+        if skin_faces == 0:
+            continue
+        had_custom = bool(getattr(me, "has_custom_normals", False))
+        ok, merged = _weld_skin_and_smooth(obj, skin_slots)
+        if ok:
+            touched.append("%s(皮肤面%d, 焊接%d, 自定义法线%s)" % (
+                obj.name, skin_faces, merged, "有→已清" if had_custom else "无"))
+    if touched:
+        return "已处理: " + "; ".join(touched)
+    return "未发现含皮肤的网格"
+
+
 def convert_selected(context, config):
     """转换选中物体：确保灯光/GN，然后逐材质构建。返回 (toon数, 保留数)。
     参考链的光照来自场景真实灯光(漫射BSDF)。场景已有 SUN 时直接用用户的灯,
@@ -2300,6 +2387,16 @@ def convert_selected(context, config):
             clear_mmd_edge(scene)
     except Exception as exc:
         print("[StarToon] 描边(mmd edge)构建失败:", exc)
+    # 皮肤法线平滑: 清掉含皮肤网格烘焙的平/硬自定义分法线(修裸露皮肤上的三角网格阴影)。
+    # 开关在面板"阴影(AutoCel)"里; 只清不重算方向。
+    try:
+        conv_objs = [o for o in context.selected_objects if o.type == 'MESH']
+        rep = apply_smooth_skin_normals(scene, objs=conv_objs)
+        if getattr(scene, "hsr_toon", None) is not None:
+            scene.hsr_toon.smooth_normals_report = rep
+        print("[StarToon] 皮肤法线:", rep)
+    except Exception as exc:
+        print("[StarToon] 皮肤法线平滑失败:", exc)
     return toon_count, keep_count
 
 

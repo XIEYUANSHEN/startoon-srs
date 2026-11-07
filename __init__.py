@@ -32,7 +32,7 @@ from . import pmx_morph
 bl_info = {
     "name": "StarToon SRS",
     "author": "AtomCode",
-    "version": (1, 7, 6),
+    "version": (1, 7, 7),
     "blender": (4, 2, 0),
     "location": "3D View > N > HSR Toon",
     "description": "仿崩铁风格 MMD 三渲二: 分类独立参数 + EASE 多级阴影 + 反法线描边 + AOV 眼透",
@@ -528,6 +528,16 @@ class HSRToonProperties(bpy.types.PropertyGroup):
         default=False,
         update=_auto_update,
     )
+    smooth_skin_normals: BoolProperty(
+        name="平滑皮肤法线",
+        description="转换时清掉【含皮肤网格】上烘焙的自定义分法线并重新平滑。平/硬法线会让三渲二阴影在裸露皮肤(如昔涟肩膀)显出三角网格。什么时候关: 模型故意用硬边法线做风格化(棱角头发/机械件)且你不想被改平时关掉。注意 Blender 自定义分法线是整网格级, 开启会连带平滑该网格其它部位",
+        default=True,
+    )
+    smooth_normals_report: StringProperty(
+        name="皮肤法线报告",
+        description="上次转换/重算时清理了哪些网格(皮肤面数, 其中平法线面数)",
+        default="",
+    )
     sheer_shadow: FloatProperty(
         name="纱/半透阴影",
         description="纱/头纱/透袖/后纱带等半透材质的 toon 阴影强度: 0=完全平光(受光均匀, 不压成死黑), 1=与普通材质相同的硬阴影。默认 0(平光)",
@@ -1001,6 +1011,11 @@ class HSR_PT_Panel(bpy.types.Panel):
         box.prop(props, "toon_shadow_cull")
         box.prop(props, "sheer_shadow", slider=True)
         box.prop(props, "sheer_lift", slider=True)
+        box.prop(props, "smooth_skin_normals")
+        if props.smooth_normals_report:
+            for _ln in props.smooth_normals_report.split("; "):
+                box.label(text=_ln.strip(), icon='NONE')
+        box.operator("hsr.smooth_skin_normals", text="重算皮肤法线(立即)", icon='NORMALS_VERTEX_FACE')
 
         box = layout.box()
         box.label(text="形态切换", icon="OUTLINER_OB_GROUP_INSTANCE")
@@ -1068,10 +1083,25 @@ class HSR_PT_Glow(bpy.types.Panel):
             r.prop(it, "strength", text="", slider=True)
 
 
+class HSR_OT_SmoothSkinNormals(bpy.types.Operator):
+    """立即对场景里含皮肤的网格清掉烘焙的平/硬自定义分法线并平滑(修裸露皮肤上的三角网格阴影)。不重新转换"""
+    bl_idname = "hsr.smooth_skin_normals"
+    bl_label = "重算皮肤法线"
+
+    def execute(self, context):
+        scene = context.scene
+        rep = shader.apply_smooth_skin_normals(scene)
+        if getattr(scene, "hsr_toon", None) is not None:
+            scene.hsr_toon.smooth_normals_report = rep
+        self.report({'INFO'}, rep)
+        return {'FINISHED'}
+
+
 classes = (HSRSkinProps, HSRFaceProps, HSRHairProps, HSRClothProps, HSREyeProps,
            HSRGlowItem,
            HSRToonProperties, HSR_OT_Convert, HSR_OT_ResetCategory,
            HSR_OT_ToggleForm, HSR_OT_Evaluate, HSR_OT_ViewportCompositor,
+           HSR_OT_SmoothSkinNormals,
            HSR_OT_RefreshGlow, HSR_PT_Panel, HSR_PT_Glow)
 
 
